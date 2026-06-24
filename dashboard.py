@@ -58,7 +58,7 @@ engine_id = st.sidebar.selectbox(
     sorted(train['engine_id'].unique())
 )
 
-# ── Life % Slider (shared across selected engine + fleet table) ───────
+# ── Life % Slider ─────────────────────────────────────────────────────
 life_pct = st.sidebar.slider(
     "⏱️ Equipment Life (%)",
     min_value=0,
@@ -74,6 +74,9 @@ st.sidebar.caption(
     "the midpoint of *its own* lifecycle, regardless of its absolute cycle count."
 )
 
+st.sidebar.divider()
+st.sidebar.info("📋 Maintenance Schedule (bottom of page) uses the reading at RUL = 60 per equipment — independent of the slider.")
+
 # ── Resolve selected engine row from life % ───────────────────────────
 engine_data = train[train['engine_id'] == engine_id].copy().reset_index(drop=True)
 total_rows = len(engine_data)
@@ -84,7 +87,6 @@ selected_cycle = int(row['cycle'])
 max_cycle = int(engine_data['cycle'].max())
 current_rul = int(row['RUL'])
 
-# Predict risk for selected life %
 risk_prob = model.predict_proba(
     scaler.transform(engine_data[feature_cols].iloc[[row_idx]])
 )[0][1]
@@ -124,7 +126,7 @@ else:
         f"at {life_pct}% of its life (cycle {selected_cycle})."
     )
 
-# ── Sensor Trends with current cycle marker ───────────────────────────
+# ── Sensor Trends ─────────────────────────────────────────────────────
 st.subheader("📈 Sensor Degradation Trends")
 top_sensors = ['sensor11', 'sensor4', 'sensor9']
 fig, axes = plt.subplots(1, 3, figsize=(14, 4))
@@ -166,18 +168,17 @@ ax3.set_title('Sensor Importance Score')
 plt.tight_layout()
 st.pyplot(fig3)
 
-# ── Fleet Overview Table ──────────────────────────────────────────────
+# ── Fleet Overview Table (synced with slider) ─────────────────────────
 st.subheader("🏭 Fleet-wide Equipment Risk Overview")
 st.caption(
     f"All 100 equipments evaluated at **{life_pct}% of their own lifecycle**. "
-    f"Each equipment's cycle count differs — the slider compares them fairly on a relative scale."
+    f"Drag the slider to explore how risk evolves across the fleet over time."
 )
 
 fleet_data = []
 for eid in sorted(train['engine_id'].unique()):
     edata = train[train['engine_id'] == eid].copy().reset_index(drop=True)
     n = len(edata)
-    # Each equipment evaluated at the same RELATIVE life stage
     midx = min(int(n * life_pct / 100), n - 1)
     prob = model.predict_proba(
         scaler.transform(edata[feature_cols].iloc[[midx]])
@@ -204,19 +205,123 @@ for eid in sorted(train['engine_id'].unique()):
 
 fleet_df = pd.DataFrame(fleet_data)
 
-# Summary metrics
 col1, col2, col3 = st.columns(3)
 critical = len(fleet_df[fleet_df['Status'] == '🔴 Critical'])
 warning  = len(fleet_df[fleet_df['Status'] == '🟡 Warning'])
 normal   = len(fleet_df[fleet_df['Status'] == '🟢 Normal'])
-
 col1.metric("🔴 Critical", critical)
 col2.metric("🟡 Warning", warning)
 col3.metric("🟢 Normal", normal)
 
-# Sortable table — highest risk first
-fleet_df = fleet_df.sort_values('Failure Risk %', ascending=False)
-st.dataframe(fleet_df, use_container_width=True, hide_index=True)
+fleet_df_sorted = fleet_df.sort_values('Failure Risk %', ascending=False)
+st.dataframe(fleet_df_sorted, use_container_width=True, hide_index=True)
+
+# ── Maintenance Schedule ──────────────────────────────────────────────
+st.divider()
+st.subheader("🔧 Maintenance Schedule Recommender")
+st.caption(
+    "Each equipment is snapshotted at the point where **RUL = 60** (well before the danger zone). "
+    "The model then scans forward to find how many cycles until failure risk crosses 70%, "
+    "and assigns a maintenance priority accordingly."
+)
+
+@st.cache_data
+def build_maintenance_schedule(_model, _scaler, train, feature_cols):
+    schedule = []
+
+    for eid in sorted(train['engine_id'].unique()):
+        edata = train[train['engine_id'] == eid].copy().reset_index(drop=True)
+        n = len(edata)
+
+        # Snapshot at RUL >= 60 — well before danger zone, gives meaningful runway
+        healthy_rows = edata[edata['RUL'] >= 60]
+        if len(healthy_rows) > 0:
+            latest_idx = healthy_rows.index[-1]  # last row where RUL is still >= 60
+        else:
+            latest_idx = 0  # very short-lived equipment, use first row
+
+        latest_row    = edata.iloc[latest_idx]
+        current_cycle = int(latest_row['cycle'])
+        current_rul   = int(latest_row['RUL'])
+
+        # Risk at this snapshot
+        current_risk = _model.predict_proba(
+            _scaler.transform(edata[feature_cols].iloc[[latest_idx]])
+        )[0][1]
+
+        # Scan forward from snapshot to find when risk first crosses 70%
+        if current_risk > 0.7:
+            cycles_to_critical = 0
+        else:
+            cycles_to_critical = None
+            for future_idx in range(latest_idx, n):
+                future_risk = _model.predict_proba(
+                    _scaler.transform(edata[feature_cols].iloc[[future_idx]])
+                )[0][1]
+                if future_risk > 0.7:
+                    cycles_to_critical = int(edata.iloc[future_idx]['cycle']) - current_cycle
+                    break
+            # Never crosses 70% in remaining data — use RUL as proxy
+            if cycles_to_critical is None:
+                cycles_to_critical = current_rul
+
+        # Priority bucket
+        if cycles_to_critical == 0:
+            priority = "🔴 Immediate"
+            action   = "Shut down and inspect now"
+        elif cycles_to_critical <= 10:
+            priority = "🟠 This Week"
+            action   = "Schedule maintenance within 7 days"
+        elif cycles_to_critical <= 30:
+            priority = "🟡 This Month"
+            action   = "Plan maintenance within 30 days"
+        else:
+            priority = "🟢 Monitor"
+            action   = "No action needed, continue monitoring"
+
+        schedule.append({
+            'Equipment ID'       : f'EQ-{eid:03d}',
+            'Current Risk %'     : round(current_risk * 100, 1),
+            'Current RUL'        : current_rul,
+            'Cycles to Critical' : cycles_to_critical,
+            'Priority'           : priority,
+            'Recommended Action' : action
+        })
+
+    return pd.DataFrame(schedule)
+
+with st.spinner("Calculating maintenance schedule for all 100 equipments..."):
+    schedule_df = build_maintenance_schedule(model, scaler, train, feature_cols)
+
+# Priority summary counts
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("🔴 Immediate",  len(schedule_df[schedule_df['Priority'] == '🔴 Immediate']))
+c2.metric("🟠 This Week",  len(schedule_df[schedule_df['Priority'] == '🟠 This Week']))
+c3.metric("🟡 This Month", len(schedule_df[schedule_df['Priority'] == '🟡 This Month']))
+c4.metric("🟢 Monitor",    len(schedule_df[schedule_df['Priority'] == '🟢 Monitor']))
+
+# Alert banner only — no duplicate table
+immediate = schedule_df[schedule_df['Priority'] == '🔴 Immediate']
+if not immediate.empty:
+    st.error(f"🚨 {len(immediate)} equipment(s) require IMMEDIATE shutdown and inspection! See table below.")
+
+# Single full schedule table sorted by urgency
+priority_order = {'🔴 Immediate': 0, '🟠 This Week': 1, '🟡 This Month': 2, '🟢 Monitor': 3}
+schedule_df['_order'] = schedule_df['Priority'].map(priority_order)
+schedule_df_sorted = schedule_df.drop(columns=['_order']).iloc[
+    schedule_df['_order'].argsort()
+]
+
+st.dataframe(schedule_df_sorted, use_container_width=True, hide_index=True)
+
+# CSV Export
+csv = schedule_df_sorted.to_csv(index=False).encode('utf-8')
+st.download_button(
+    label="📥 Download Maintenance Schedule as CSV",
+    data=csv,
+    file_name="ongc_maintenance_schedule.csv",
+    mime="text/csv"
+)
 
 st.divider()
 st.caption("ONGC Predictive Maintenance System | Built with XGBoost + Streamlit | AUC: 0.9911")
