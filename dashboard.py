@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import IsolationForest
 
 st.set_page_config(page_title="ONGC Predictive Maintenance", layout="wide")
 
@@ -42,8 +43,28 @@ def train_model(train):
     model.fit(X_train_scaled, y_train)
     return model, scaler, feature_cols
 
+# ── Train Isolation Forest on healthy data (RUL > 60) ────────────────
+@st.cache_resource
+def train_anomaly_detectors(train, feature_cols):
+    """
+    Train one Isolation Forest per sensor using only healthy data (RUL > 60).
+    This teaches the model what 'normal' looks like for each sensor.
+    Any reading that deviates from this normal baseline is flagged as anomalous.
+    """
+    healthy = train[train['RUL'] > 60]
+    detectors = {}
+    for sensor in feature_cols:
+        if sensor == 'cycle':
+            continue
+        iso = IsolationForest(contamination=0.05, random_state=42)
+        iso.fit(healthy[[sensor]])
+        detectors[sensor] = iso
+    return detectors
+
 train = load_data()
 model, scaler, feature_cols = train_model(train)
+sensor_cols = [c for c in feature_cols if c != 'cycle']
+detectors = train_anomaly_detectors(train, feature_cols)
 
 # ── Sidebar ───────────────────────────────────────────────────────────
 st.sidebar.image(
@@ -58,15 +79,13 @@ engine_id = st.sidebar.selectbox(
     sorted(train['engine_id'].unique())
 )
 
-# ── Life % Slider ─────────────────────────────────────────────────────
 life_pct = st.sidebar.slider(
     "⏱️ Equipment Life (%)",
     min_value=0,
     max_value=100,
     value=50,
     step=1,
-    help="0% = brand new  |  100% = end of life. "
-         "Each equipment is evaluated at this percentage of its own total life."
+    help="0% = brand new  |  100% = end of life."
 )
 
 st.sidebar.caption(
@@ -75,7 +94,7 @@ st.sidebar.caption(
 )
 
 st.sidebar.divider()
-st.sidebar.info("📋 Maintenance Schedule (bottom of page) uses the reading at RUL = 60 per equipment — independent of the slider.")
+st.sidebar.info("📋 Maintenance Schedule (bottom of page) uses the reading at RUL ≥ 60 per equipment — independent of the slider.")
 
 # ── Resolve selected engine row from life % ───────────────────────────
 engine_data = train[train['engine_id'] == engine_id].copy().reset_index(drop=True)
@@ -168,7 +187,94 @@ ax3.set_title('Sensor Importance Score')
 plt.tight_layout()
 st.pyplot(fig3)
 
+# ── Anomaly Detection ─────────────────────────────────────────────────
+st.divider()
+st.subheader("🔬 Sensor Anomaly Detection")
+st.caption(
+    f"Each sensor on EQ-{engine_id:03d} is compared against its normal baseline "
+    f"(learned from healthy equipment with RUL > 60). "
+    f"A sensor is flagged anomalous if its current reading falls outside the normal range."
+)
+
+# Get current sensor readings at selected life %
+current_readings = engine_data[sensor_cols].iloc[row_idx]
+
+# Run each sensor through its Isolation Forest
+anomaly_results = []
+for sensor in sensor_cols:
+    value = float(current_readings[sensor])
+    prediction = detectors[sensor].predict([[value]])[0]  # 1=normal, -1=anomalous
+    score = detectors[sensor].decision_function([[value]])[0]  # lower = more anomalous
+
+    # Get normal range from healthy data for this sensor
+    healthy_vals = train[train['RUL'] > 60][sensor]
+    normal_min = round(float(healthy_vals.quantile(0.05)), 3)
+    normal_max = round(float(healthy_vals.quantile(0.95)), 3)
+
+    is_anomaly = prediction == -1
+    anomaly_results.append({
+        'Sensor'        : sensor.upper(),
+        'Current Value' : round(value, 3),
+        'Normal Min'    : normal_min,
+        'Normal Max'    : normal_max,
+        'Status'        : "🔴 Anomalous" if is_anomaly else "🟢 Normal",
+        'Anomaly Score' : round(score, 4)  # more negative = more anomalous
+    })
+
+anomaly_df = pd.DataFrame(anomaly_results)
+anomalous = anomaly_df[anomaly_df['Status'] == '🔴 Anomalous']
+normal_sensors = anomaly_df[anomaly_df['Status'] == '🟢 Normal']
+
+# Summary
+a1, a2 = st.columns(2)
+a1.metric("🔴 Anomalous Sensors", len(anomalous))
+a2.metric("🟢 Normal Sensors", len(normal_sensors))
+
+# Alert if any anomalies found
+if len(anomalous) > 0:
+    sensor_list = ', '.join(anomalous['Sensor'].tolist())
+    if risk_prob <= 0.4:
+        st.warning(
+            f"⚠️ EARLY WARNING: Overall risk score is low but "
+            f"{len(anomalous)} sensor(s) are behaving abnormally: **{sensor_list}**. "
+            f"Monitor closely — this may indicate early-stage degradation."
+        )
+    else:
+        st.error(
+            f"🚨 {len(anomalous)} sensor(s) showing abnormal readings: **{sensor_list}**. "
+            f"Combined with high risk score — immediate inspection recommended."
+        )
+else:
+    st.success(f"✅ All sensors on EQ-{engine_id:03d} are reading within normal range.")
+
+# Anomaly table sorted — anomalous first
+anomaly_df_sorted = anomaly_df.sort_values('Anomaly Score', ascending=True)
+st.dataframe(anomaly_df_sorted, use_container_width=True, hide_index=True)
+
+# Anomaly trend chart — show anomaly score over full lifecycle
+st.markdown("##### Anomaly Score Over Time (lower = more abnormal)")
+st.caption("Shows how each sensor's anomaly score evolves over the equipment's lifecycle. "
+           "A dropping score means the sensor is drifting away from normal behaviour.")
+
+fig4, ax4 = plt.subplots(figsize=(12, 4))
+for sensor in sensor_cols:
+    scores = [
+        detectors[sensor].decision_function([[v]])[0]
+        for v in engine_data[sensor].values
+    ]
+    ax4.plot(engine_data['cycle'].values, scores, linewidth=1, alpha=0.7, label=sensor.upper())
+
+ax4.axvline(x=selected_cycle, color='black', linestyle='--', linewidth=2,
+            label=f'Current cycle {selected_cycle}')
+ax4.axhline(y=0, color='red', linestyle='--', linewidth=1, label='Anomaly threshold')
+ax4.set_xlabel('Cycle')
+ax4.set_ylabel('Anomaly Score (negative = anomalous)')
+ax4.legend(fontsize=7, ncol=3)
+plt.tight_layout()
+st.pyplot(fig4)
+
 # ── Fleet Overview Table (synced with slider) ─────────────────────────
+st.divider()
 st.subheader("🏭 Fleet-wide Equipment Risk Overview")
 st.caption(
     f"All 100 equipments evaluated at **{life_pct}% of their own lifecycle**. "
@@ -220,7 +326,7 @@ st.dataframe(fleet_df_sorted, use_container_width=True, hide_index=True)
 st.divider()
 st.subheader("🔧 Maintenance Schedule Recommender")
 st.caption(
-    "Each equipment is snapshotted at the point where **RUL = 60** (well before the danger zone). "
+    "Each equipment is snapshotted at the point where **RUL ≥ 60** (well before the danger zone). "
     "The model then scans forward to find how many cycles until failure risk crosses 70%, "
     "and assigns a maintenance priority accordingly."
 )
@@ -228,28 +334,24 @@ st.caption(
 @st.cache_data
 def build_maintenance_schedule(_model, _scaler, train, feature_cols):
     schedule = []
-
     for eid in sorted(train['engine_id'].unique()):
         edata = train[train['engine_id'] == eid].copy().reset_index(drop=True)
         n = len(edata)
 
-        # Snapshot at RUL >= 60 — well before danger zone, gives meaningful runway
         healthy_rows = edata[edata['RUL'] >= 60]
         if len(healthy_rows) > 0:
-            latest_idx = healthy_rows.index[-1]  # last row where RUL is still >= 60
+            latest_idx = healthy_rows.index[-1]
         else:
-            latest_idx = 0  # very short-lived equipment, use first row
+            latest_idx = 0
 
         latest_row    = edata.iloc[latest_idx]
         current_cycle = int(latest_row['cycle'])
         current_rul   = int(latest_row['RUL'])
 
-        # Risk at this snapshot
         current_risk = _model.predict_proba(
             _scaler.transform(edata[feature_cols].iloc[[latest_idx]])
         )[0][1]
 
-        # Scan forward from snapshot to find when risk first crosses 70%
         if current_risk > 0.7:
             cycles_to_critical = 0
         else:
@@ -261,11 +363,9 @@ def build_maintenance_schedule(_model, _scaler, train, feature_cols):
                 if future_risk > 0.7:
                     cycles_to_critical = int(edata.iloc[future_idx]['cycle']) - current_cycle
                     break
-            # Never crosses 70% in remaining data — use RUL as proxy
             if cycles_to_critical is None:
                 cycles_to_critical = current_rul
 
-        # Priority bucket
         if cycles_to_critical == 0:
             priority = "🔴 Immediate"
             action   = "Shut down and inspect now"
@@ -293,19 +393,16 @@ def build_maintenance_schedule(_model, _scaler, train, feature_cols):
 with st.spinner("Calculating maintenance schedule for all 100 equipments..."):
     schedule_df = build_maintenance_schedule(model, scaler, train, feature_cols)
 
-# Priority summary counts
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("🔴 Immediate",  len(schedule_df[schedule_df['Priority'] == '🔴 Immediate']))
 c2.metric("🟠 This Week",  len(schedule_df[schedule_df['Priority'] == '🟠 This Week']))
 c3.metric("🟡 This Month", len(schedule_df[schedule_df['Priority'] == '🟡 This Month']))
 c4.metric("🟢 Monitor",    len(schedule_df[schedule_df['Priority'] == '🟢 Monitor']))
 
-# Alert banner only — no duplicate table
 immediate = schedule_df[schedule_df['Priority'] == '🔴 Immediate']
 if not immediate.empty:
     st.error(f"🚨 {len(immediate)} equipment(s) require IMMEDIATE shutdown and inspection! See table below.")
 
-# Single full schedule table sorted by urgency
 priority_order = {'🔴 Immediate': 0, '🟠 This Week': 1, '🟡 This Month': 2, '🟢 Monitor': 3}
 schedule_df['_order'] = schedule_df['Priority'].map(priority_order)
 schedule_df_sorted = schedule_df.drop(columns=['_order']).iloc[
@@ -314,7 +411,6 @@ schedule_df_sorted = schedule_df.drop(columns=['_order']).iloc[
 
 st.dataframe(schedule_df_sorted, use_container_width=True, hide_index=True)
 
-# CSV Export
 csv = schedule_df_sorted.to_csv(index=False).encode('utf-8')
 st.download_button(
     label="📥 Download Maintenance Schedule as CSV",
