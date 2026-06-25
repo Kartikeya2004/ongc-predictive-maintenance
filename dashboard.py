@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import IsolationForest
 
-st.set_page_config(page_title="ONGC Predictive Maintenance", layout="wide")
+st.set_page_config(page_title="Predictive Maintenance System", layout="wide")
 
 # ── Load & prepare data ──────────────────────────────────────────────
 @st.cache_data
@@ -68,10 +68,10 @@ detectors = train_anomaly_detectors(train, feature_cols)
 
 # ── Sidebar ───────────────────────────────────────────────────────────
 st.sidebar.image(
-    "https://upload.wikimedia.org/wikipedia/en/thumb/8/8d/ONGC_Logo.svg/200px-ONGC_Logo.svg.png",
+    "https://upload.wikimedia.org/wikipedia/en/thumb/8/8d/Industrial_Logo.svg/200px-Industrial_Logo.svg.png",
     width=150
 )
-st.sidebar.title("ONGC Predictive Maintenance")
+st.sidebar.title("Industrial Predictive Maintenance")
 st.sidebar.markdown("AI-powered equipment failure detection system")
 
 engine_id = st.sidebar.selectbox(
@@ -111,7 +111,7 @@ risk_prob = model.predict_proba(
 )[0][1]
 
 # ── Main Header ───────────────────────────────────────────────────────
-st.title("🛢️ ONGC Equipment Health Monitor")
+st.title("🛢️ Industrial Equipment Health Monitor")
 st.markdown("Real-time failure risk prediction using Machine Learning")
 st.divider()
 
@@ -415,9 +415,163 @@ csv = schedule_df_sorted.to_csv(index=False).encode('utf-8')
 st.download_button(
     label="📥 Download Maintenance Schedule as CSV",
     data=csv,
-    file_name="ongc_maintenance_schedule.csv",
+    file_name="Industrial_maintenance_schedule.csv",
     mime="text/csv"
 )
 
+# ── Cost Savings Estimator ────────────────────────────────────────────
 st.divider()
-st.caption("ONGC Predictive Maintenance System | Built with XGBoost + Streamlit | AUC: 0.9911")
+st.subheader("💰 Maintenance Cost Savings Estimator")
+st.caption("Estimate how much Industrial saves annually by using predictive vs reactive maintenance.")
+
+col1, col2 = st.columns(2)
+with col1:
+    reactive_cost = st.number_input(
+        "Cost of reactive failure (₹ lakhs per incident)",
+        min_value=1.0, max_value=500.0, value=50.0, step=1.0
+    )
+    predictive_cost = st.number_input(
+        "Cost of planned maintenance (₹ lakhs per service)",
+        min_value=1.0, max_value=100.0, value=10.0, step=1.0
+    )
+with col2:
+    failures_per_year = st.number_input(
+        "Estimated failures per year (without system)",
+        min_value=1, max_value=100, value=20, step=1
+    )
+    catch_rate = st.slider(
+        "Model catch rate (%)", 
+        min_value=50, max_value=100, value=92
+    )
+
+caught = int(failures_per_year * catch_rate / 100)
+missed = failures_per_year - caught
+
+reactive_total   = failures_per_year * reactive_cost
+predictive_total = (caught * predictive_cost) + (missed * reactive_cost)
+savings          = reactive_total - predictive_total
+
+st.divider()
+m1, m2, m3 = st.columns(3)
+m1.metric("Without AI (₹ lakhs/year)", f"₹{reactive_total:.1f}L",
+          help="Cost if all failures are reactive")
+m2.metric("With AI System (₹ lakhs/year)", f"₹{predictive_total:.1f}L",
+          help="Cost with predictive maintenance")
+m3.metric("Annual Savings", f"₹{savings:.1f}L",
+          delta=f"↓ {round(savings/reactive_total*100)}% reduction",
+          delta_color="normal")
+
+if savings > 0:
+    st.success(f"✅ The Industrial Predictive Maintenance System saves approximately ₹{savings:.1f} lakhs per year — a {round(savings/reactive_total*100)}% reduction in maintenance costs.")
+else:
+    st.warning("Adjust the inputs — predictive maintenance should cost less than reactive.")
+
+# ROI bar chart
+fig_roi, ax_roi = plt.subplots(figsize=(7, 4))
+bars = ax_roi.bar(
+    ['Reactive\n(No AI)', 'Predictive\n(With AI)'],
+    [reactive_total, predictive_total],
+    color=['crimson', 'steelblue'], width=0.4
+)
+ax_roi.set_ylabel('Annual Cost (₹ Lakhs)')
+ax_roi.set_title('Reactive vs Predictive Maintenance Cost')
+for bar, val in zip(bars, [reactive_total, predictive_total]):
+    ax_roi.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                f'₹{val:.1f}L', ha='center', fontsize=11, fontweight='bold')
+plt.tight_layout()
+st.pyplot(fig_roi)
+
+# ── Downtime Estimator ────────────────────────────────────────────────
+st.divider()
+st.subheader("⏱️ Downtime & Repair Schedule Estimator")
+st.caption("Estimates when maintenance should be performed and expected downtime based on failure risk.")
+
+engine_schedule = schedule_df[schedule_df['Equipment ID'] == f'EQ-{engine_id:03d}'].iloc[0]
+cycles_to_critical = int(engine_schedule['Cycles to Critical'])
+
+col1, col2 = st.columns(2)
+with col1:
+    cycle_duration_hours = st.number_input(
+        "Duration of one operational cycle (hours)",
+        min_value=1, max_value=48, value=8, step=1
+    )
+with col2:
+    repair_duration_hours = st.number_input(
+        "Estimated repair/maintenance duration (hours)",
+        min_value=1, max_value=240, value=24, step=1
+    )
+
+# Calculate timing
+hours_to_maintenance = cycles_to_critical * cycle_duration_hours
+days_to_maintenance  = hours_to_maintenance / 24
+
+from datetime import datetime, timedelta
+maintenance_date = datetime.now() + timedelta(hours=hours_to_maintenance)
+
+st.divider()
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Cycles to Critical", cycles_to_critical)
+m2.metric("Days Until Maintenance", f"{days_to_maintenance:.1f} days")
+m3.metric("Recommended Maintenance Date", maintenance_date.strftime("%d %b %Y"))
+m4.metric("Expected Downtime", f"{repair_duration_hours} hours")
+
+# Timeline visualization
+fig_time, ax_time = plt.subplots(figsize=(12, 3))
+
+now_x         = 0
+maintenance_x = days_to_maintenance
+back_online_x = days_to_maintenance + repair_duration_hours / 24
+
+ax_time.barh(0, maintenance_x, color='steelblue', height=0.4, label='Safe operating window')
+ax_time.barh(0, repair_duration_hours / 24, left=maintenance_x,
+             color='orange', height=0.4, label='Maintenance window')
+ax_time.barh(0, 10, left=back_online_x,
+             color='green', height=0.4, label='Back online')
+
+ax_time.axvline(x=now_x, color='black', linewidth=2, linestyle='--')
+ax_time.axvline(x=maintenance_x, color='red', linewidth=2, linestyle='--')
+ax_time.axvline(x=back_online_x, color='green', linewidth=2, linestyle='--')
+
+ax_time.text(now_x + 0.2, 0.3, 'Today', fontsize=9, color='black')
+ax_time.text(maintenance_x + 0.2, 0.3,
+             f'Maintenance\n{maintenance_date.strftime("%d %b")}',
+             fontsize=9, color='red')
+ax_time.text(back_online_x + 0.2, 0.3, 'Back Online', fontsize=9, color='green')
+
+ax_time.set_xlabel('Days from now')
+ax_time.set_title(f'EQ-{engine_id:03d} — Maintenance Timeline')
+ax_time.set_yticks([])
+ax_time.legend(loc='lower right', fontsize=8)
+plt.tight_layout()
+st.pyplot(fig_time)
+
+# Production loss estimate
+st.markdown("##### 📉 Production Loss During Downtime")
+col1, col2 = st.columns(2)
+with col1:
+    production_per_hour = st.number_input(
+        "Production rate (barrels per hour)",
+        min_value=10, max_value=10000, value=500, step=10
+    )
+with col2:
+    oil_price_per_barrel = st.number_input(
+        "Oil price (₹ per barrel)",
+        min_value=1000, max_value=20000, value=6500, step=100
+    )
+
+lost_barrels  = production_per_hour * repair_duration_hours
+lost_revenue  = lost_barrels * oil_price_per_barrel / 100000  # in lakhs
+
+c1, c2 = st.columns(2)
+c1.metric("Lost Production", f"{lost_barrels:,} barrels")
+c2.metric("Revenue Loss During Downtime", f"₹{lost_revenue:.1f} lakhs")
+
+if cycles_to_critical <= 10:
+    st.error(f"🚨 EQ-{engine_id:03d} needs maintenance within {days_to_maintenance:.1f} days. Plan immediately to minimize production loss.")
+elif cycles_to_critical <= 30:
+    st.warning(f"⚠️ Schedule maintenance for EQ-{engine_id:03d} by {maintenance_date.strftime('%d %b %Y')} to avoid unplanned downtime.")
+else:
+    st.success(f"✅ EQ-{engine_id:03d} has {days_to_maintenance:.1f} days before maintenance is needed. Plan at your convenience.")
+
+st.divider()
+st.caption("Industrial Predictive Maintenance System | Built with XGBoost + Streamlit | AUC: 0.9911")
